@@ -99,11 +99,17 @@ PRIVATE
 
     # AyuGram filters
     ayugram::lib_icu
+
+    # AyuGram Python plugins
+    pybind11::embed
+    Python3::Python
 )
 
 set(ayugram_files
         ayu/ayu_worker.cpp
         ayu/ayu_worker.h
+        ayu/ayu_plugins.cpp
+        ayu/ayu_plugins.h
         ayu/ayu_url_handlers.cpp
         ayu/ayu_url_handlers.h
         ayu/ayu_state.cpp
