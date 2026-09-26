@@ -26,9 +26,14 @@ jobs:
 
       # --- Официальный шаг подготовки библиотек (Telegram/build/prepare/win.bat) ---
       # Скачивает предсобранные Qt/webrtc/прочие зависимости — самый долгий шаг.
+      # win.bat проверяет переменную окружения Platform (её выставляет
+      # vcvars64.bat), поэтому сначала обязательно нужно войти в Native
+      # Tools Command Prompt — иначе падает с "Make sure to run from
+      # Native Tools Command Prompt."
       - name: Prepare libraries (official win.bat)
         shell: cmd
         run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
           call tdesktop\Telegram\build\prepare\win.bat
 
       # --- Проверка/установка нужных компонентов Visual Studio ---
