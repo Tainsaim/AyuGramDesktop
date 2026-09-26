@@ -1,0 +1,91 @@
+name: Build AyuGram Desktop (with Python plugins)
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [dev-with-plugins]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 300 # полная сборка tdesktop-based клиента долгая, обычный
+                          # лимит job'а (360 мин на публичных раннерах) может не хватить —
+                          # при необходимости используйте self-hosted runner или сплитуйте job
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: tdesktop
+
+      - name: Setup Python 3.10 (для сборочных скриптов и embedding)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # --- Официальный шаг подготовки библиотек (Telegram/build/prepare/win.bat) ---
+      # Скачивает предсобранные Qt/webrtc/прочие зависимости — самый долгий шаг.
+      - name: Prepare libraries (official win.bat)
+        shell: cmd
+        run: |
+          call tdesktop\Telegram\build\prepare\win.bat
+
+      # --- Проверка/установка нужных компонентов Visual Studio ---
+      # windows-latest обычно уже содержит VS Build Tools, но состав компонентов
+      # (C++ MFC/ATL нужных версий, конкретный Windows SDK) может отличаться.
+      # Este шаг — best-effort: подставьте актуальные Component ID под версию
+      # образа раннера на момент сборки (см. docs/building-win.md апстрима).
+      - name: Ensure required VS components (MFC/ATL/SDK)
+        shell: pwsh
+        run: |
+          $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          if (Test-Path $vsInstaller) {
+            & $vsInstaller modify --installPath "C:\Program Files\Microsoft Visual Studio\2022\Enterprise" `
+              --add Microsoft.VisualStudio.Component.VC.ATL `
+              --add Microsoft.VisualStudio.Component.VC.ATL.ARM64 `
+              --add Microsoft.VisualStudio.Component.VC.MFC `
+              --add Microsoft.VisualStudio.Component.Windows11SDK.26100 `
+              --quiet --norestart
+          } else {
+            Write-Host "vs_installer.exe not found at expected path — проверьте вручную путь установки VS на раннере."
+          }
+
+      # --- Конфигурация проекта (официальная команда из docs/building-win.md) ---
+      # ВАЖНО: используйте свои собственные api_id/api_hash с my.telegram.org,
+      # а не публичные из документации, если планируете распространять сборку.
+      - name: Configure (CMake via configure.bat)
+        shell: cmd
+        env:
+          TDESKTOP_API_ID: ${{ secrets.TDESKTOP_API_ID }}
+          TDESKTOP_API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
+          cd tdesktop\Telegram
+          configure.bat x64 -D TDESKTOP_API_ID=%TDESKTOP_API_ID% -D TDESKTOP_API_HASH=%TDESKTOP_API_HASH%
+
+      - name: Build (Release)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
+          msbuild tdesktop\out\Telegram.slnx /p:Configuration=Release /p:Platform=x64 /m
+
+      # --- Раскладываем наш Python-плагин рядом с итоговым exe ---
+      - name: Bundle Python plugin runtime
+        shell: pwsh
+        run: |
+          $outDir = "tdesktop\out\Release"
+          New-Item -ItemType Directory -Force -Path "$outDir\plugins_runtime" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$outDir\plugins" | Out-Null
+          Copy-Item "tdesktop\python\desktop_plugin_api.py" "$outDir\plugins_runtime\desktop_plugin_api.py"
+          Copy-Item "tdesktop\python\plugins\quotify_plus_desktop.py" "$outDir\plugins\quotify_plus_desktop.py"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AyuGramDesktop-with-plugins-windows-x64
+          path: |
+            tdesktop/out/Release/*.exe
+            tdesktop/out/Release/plugins/**
+            tdesktop/out/Release/plugins_runtime/**
+          if-no-files-found: warn
