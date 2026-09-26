@@ -7,6 +7,7 @@
 #include "ayu/ayu_infra.h"
 
 #include "ayu/ayu_lang.h"
+#include "ayu/ayu_plugins.h"
 #include "ayu/ayu_settings.h"
 #include "ayu/ayu_ui_settings.h"
 #include "ayu/ayu_worker.h"
@@ -60,6 +61,15 @@ void initTranslator() {
 	Ayu::Translator::TranslateManager::init();
 }
 
+void initPlugins() {
+	// Тот же принцип путей, что и в ayu_settings.cpp (getSettingsPath):
+	// pluginsDir лежит рядом с exe (как раскладывает наш CI workflow),
+	// storageDir — рядом с остальными данными AyuGram в tdata/.
+	const auto pluginsDir = cWorkingDir() + u"plugins/"_q;
+	const auto storageDir = cWorkingDir() + u"tdata/ayu_plugins/"_q;
+	Ayu::Plugins::Manager::instance().initialize(pluginsDir, storageDir);
+}
+
 void initIcon() {
 #ifdef Q_OS_WIN
 	AyuAssets::loadAppIco();
@@ -75,6 +85,7 @@ void init() {
 	initWorker();
 	initRCManager();
 	initTranslator();
+	initPlugins();
 }
 
 }
