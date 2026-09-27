@@ -47,33 +47,44 @@ jobs:
           Write-Host "Visual Studio: $vsPath"
           "vsPath=$vsPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
 
-      # --- Проверка/доустановка ATL+MFC ---
-      # prepare.py собирает breakpad, которому нужны заголовки ATL по легаси-пути
-      # <VS>\VC\atlmfc\include (atlbase.h/atlcomcli.h). Если их нет — доустанавливаем
-      # компонент через VS Installer (best-effort; при успехе это no-op и возврат 0).
+      # --- Обеспечиваем ATL+MFC для breakpad ---
+      # prepare.py собирает breakpad, который жёстко ищет заголовки ATL по легаси-пути
+      # <VS>\VC\atlmfc\include (atlbase.h/atlcomcli.h). В VS 2022/2026 ATL/MFC лежат
+      # в <VS>\VC\Tools\MSVC\<ver>\atlmfc, а не на верхнем уровне, поэтому breakpad
+      # их не находит. Решение: создаём junction VC\atlmfc на реальную папку atlmfc
+      # тулсета (fallback — доустановка компонента через VS Installer).
       - name: Ensure ATL/MFC (needed by breakpad)
         shell: pwsh
         run: |
           $vsPath = "${{ steps.vsfind.outputs.vsPath }}"
-          $atlBase = Join-Path $vsPath "VC\atlmfc\include\atlbase.h"
-          if (Test-Path $atlBase) {
-            Write-Host "ATL/MFC already present."
+          $legacy = Join-Path $vsPath "VC\atlmfc"
+          if (Test-Path (Join-Path $legacy "include\atlbase.h")) {
+            Write-Host "ATL/MFC already present at $legacy."
             exit 0
           }
           $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
-          if (-not (Test-Path $vsInstaller)) {
-            throw "vs_installer.exe not found; cannot install ATL/MFC."
+          if (Test-Path $vsInstaller) {
+            Write-Host "Installing VC.ATLMFC component via VS Installer (best-effort)..."
+            & $vsInstaller modify --installPath $vsPath `
+              --add Microsoft.VisualStudio.Component.VC.ATLMFC `
+              --quiet --norestart
+            Write-Host "vs_installer exit code: $LASTEXITCODE"
+          } else {
+            Write-Host "vs_installer.exe not found; skipping component install."
           }
-          & $vsInstaller modify --installPath $vsPath `
-            --add Microsoft.VisualStudio.Component.VC.ATLMFC `
-            --quiet --norestart --force
-          if ($LASTEXITCODE -ne 0) {
-            throw "vs_installer modify failed with exit code $LASTEXITCODE"
+          $atlDir = Get-ChildItem -Path (Join-Path $vsPath "VC\Tools\MSVC") -Directory `
+            -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName "atlmfc" } |
+            Where-Object { Test-Path (Join-Path $_ "include\atlbase.h") } |
+            Select-Object -First 1
+          if (-not $atlDir) {
+            throw "ATL/MFC headers not found anywhere under $vsPath"
           }
-          if (-not (Test-Path $atlBase)) {
-            throw "ATL/MFC still missing after install."
+          if (Test-Path $legacy) {
+            Remove-Item -LiteralPath $legacy -Recurse -Force
           }
-          Write-Host "ATL/MFC installed."
+          New-Item -ItemType Junction -Path $legacy -Target $atlDir | Out-Null
+          Write-Host "Created junction: $legacy -> $atlDir"
 
       # --- Официальный шаг подготовки библиотек (Telegram/build/prepare/win.bat) ---
       # Скачивает предсобранные Qt/webrtc/прочие зависимости — самый долгий шаг.
