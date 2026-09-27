@@ -7,7 +7,11 @@ on:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    # windows-2022 = Windows Server 2022 + Visual Studio 2022 (17.14): именно эта
+    # версия официально поддерживается tdesktop. На windows-latest сейчас стоит
+    # VS 2026, где breakpad (шаг prepare) не находит ATL по легаси-пути
+    # $(VSInstallDir)/VC/atlmfc/include, из-за чего сборка падает.
+    runs-on: windows-2022
     timeout-minutes: 300 # полная сборка tdesktop-based клиента долгая, обычный
                           # лимит job'а (360 мин на публичных раннерах) может не хватить —
                           # при необходимости используйте self-hosted runner или сплитуйте job
@@ -25,11 +29,9 @@ jobs:
           python-version: "3.10"
 
       # --- Подготовка окружения Visual Studio ---
-      # windows-latest = Windows Server 2025 с Visual Studio 2026 (ставится в
-      # C:\Program Files\Microsoft Visual Studio\18\...), поэтому hardcoded-путь
-      # к VS 2022 здесь не работает. Путём vcvars64.bat через vswhere — работает
-      # на любом образе. -vcvars_ver=14.44 нужен обязательно: дефолтный toolset
-      # VS 2026 (v145) не поддерживает Windows 7 (см. docs/building-win.md).
+      # Путём vcvars64.bat находим через vswhere — работает на любом образе.
+      # -vcvars_ver=14.44 нужен обязательно: дефолтный toolset VS 2026 (v145)
+      # не поддерживает Windows 7 (см. docs/building-win.md).
       - name: Find Visual Studio (vswhere)
         id: vsfind
         shell: pwsh
@@ -44,6 +46,34 @@ jobs:
           $vsPath = $vsPath.Trim()
           Write-Host "Visual Studio: $vsPath"
           "vsPath=$vsPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+
+      # --- Проверка/доустановка ATL+MFC ---
+      # prepare.py собирает breakpad, которому нужны заголовки ATL по легаси-пути
+      # <VS>\VC\atlmfc\include (atlbase.h/atlcomcli.h). Если их нет — доустанавливаем
+      # компонент через VS Installer (best-effort; при успехе это no-op и возврат 0).
+      - name: Ensure ATL/MFC (needed by breakpad)
+        shell: pwsh
+        run: |
+          $vsPath = "${{ steps.vsfind.outputs.vsPath }}"
+          $atlBase = Join-Path $vsPath "VC\atlmfc\include\atlbase.h"
+          if (Test-Path $atlBase) {
+            Write-Host "ATL/MFC already present."
+            exit 0
+          }
+          $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          if (-not (Test-Path $vsInstaller)) {
+            throw "vs_installer.exe not found; cannot install ATL/MFC."
+          }
+          & $vsInstaller modify --installPath $vsPath `
+            --add Microsoft.VisualStudio.Component.VC.ATLMFC `
+            --quiet --norestart --force
+          if ($LASTEXITCODE -ne 0) {
+            throw "vs_installer modify failed with exit code $LASTEXITCODE"
+          }
+          if (-not (Test-Path $atlBase)) {
+            throw "ATL/MFC still missing after install."
+          }
+          Write-Host "ATL/MFC installed."
 
       # --- Официальный шаг подготовки библиотек (Telegram/build/prepare/win.bat) ---
       # Скачивает предсобранные Qt/webrtc/прочие зависимости — самый долгий шаг.
