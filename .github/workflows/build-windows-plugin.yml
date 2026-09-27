@@ -3,7 +3,7 @@ name: Build AyuGram Desktop (with Python plugins)
 on:
   workflow_dispatch: {}
   push:
-    branches: [dev-with-plugins]
+    branches: [dev]
 
 jobs:
   build-windows:
@@ -24,6 +24,27 @@ jobs:
         with:
           python-version: "3.10"
 
+      # --- Подготовка окружения Visual Studio ---
+      # windows-latest = Windows Server 2025 с Visual Studio 2026 (ставится в
+      # C:\Program Files\Microsoft Visual Studio\18\...), поэтому hardcoded-путь
+      # к VS 2022 здесь не работает. Путём vcvars64.bat через vswhere — работает
+      # на любом образе. -vcvars_ver=14.44 нужен обязательно: дефолтный toolset
+      # VS 2026 (v145) не поддерживает Windows 7 (см. docs/building-win.md).
+      - name: Find Visual Studio (vswhere)
+        id: vsfind
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vsPath) {
+            throw "Visual Studio with C++ tools not found on the runner."
+          }
+          $vsPath = $vsPath.Trim()
+          Write-Host "Visual Studio: $vsPath"
+          "vsPath=$vsPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+
       # --- Официальный шаг подготовки библиотек (Telegram/build/prepare/win.bat) ---
       # Скачивает предсобранные Qt/webrtc/прочие зависимости — самый долгий шаг.
       # win.bat проверяет переменную окружения Platform (её выставляет
@@ -33,47 +54,33 @@ jobs:
       - name: Prepare libraries (official win.bat)
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
+          call "${{ steps.vsfind.outputs.vsPath }}\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
           call tdesktop\Telegram\build\prepare\win.bat
-
-      # --- Проверка/установка нужных компонентов Visual Studio ---
-      # windows-latest обычно уже содержит VS Build Tools, но состав компонентов
-      # (C++ MFC/ATL нужных версий, конкретный Windows SDK) может отличаться.
-      # Este шаг — best-effort: подставьте актуальные Component ID под версию
-      # образа раннера на момент сборки (см. docs/building-win.md апстрима).
-      - name: Ensure required VS components (MFC/ATL/SDK)
-        shell: pwsh
-        run: |
-          $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
-          if (Test-Path $vsInstaller) {
-            & $vsInstaller modify --installPath "C:\Program Files\Microsoft Visual Studio\2022\Enterprise" `
-              --add Microsoft.VisualStudio.Component.VC.ATL `
-              --add Microsoft.VisualStudio.Component.VC.ATL.ARM64 `
-              --add Microsoft.VisualStudio.Component.VC.MFC `
-              --add Microsoft.VisualStudio.Component.Windows11SDK.26100 `
-              --quiet --norestart
-          } else {
-            Write-Host "vs_installer.exe not found at expected path — проверьте вручную путь установки VS на раннере."
-          }
 
       # --- Конфигурация проекта (официальная команда из docs/building-win.md) ---
       # ВАЖНО: используйте свои собственные api_id/api_hash с my.telegram.org,
       # а не публичные из документации, если планируете распространять сборку.
+      # Если секреты TDESKTOP_API_ID/TDESKTOP_API_HASH не заданы, подставляются
+      # публичные тестовые ключи из docs/building-win.md.
       - name: Configure (CMake via configure.bat)
         shell: cmd
         env:
           TDESKTOP_API_ID: ${{ secrets.TDESKTOP_API_ID }}
           TDESKTOP_API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
+          call "${{ steps.vsfind.outputs.vsPath }}\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
+          if "%TDESKTOP_API_ID%"=="" set "TDESKTOP_API_ID=2040"
+          if "%TDESKTOP_API_HASH%"=="" set "TDESKTOP_API_HASH=b18441a1ff607e10a989891a5462e627"
           cd tdesktop\Telegram
           configure.bat x64 -D TDESKTOP_API_ID=%TDESKTOP_API_ID% -D TDESKTOP_API_HASH=%TDESKTOP_API_HASH%
 
+      # Сборка только target'а Telegram (с зависимостями): сборка всего solution
+      # в Release на hosted-раннере рискует не уложиться в лимит времени job'а.
       - name: Build (Release)
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
-          msbuild tdesktop\out\Telegram.slnx /p:Configuration=Release /p:Platform=x64 /m
+          call "${{ steps.vsfind.outputs.vsPath }}\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
+          msbuild tdesktop\out\Telegram.slnx /t:Telegram /p:Configuration=Release /p:Platform=x64 /m
 
       # --- Раскладываем наш Python-плагин рядом с итоговым exe ---
       - name: Bundle Python plugin runtime
