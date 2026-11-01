@@ -64,20 +64,10 @@ if (DESKTOP_APP_TEST_APPS OR DESKTOP_APP_SPECIAL_TARGET)
     include(cmake/test_update_verify.cmake)
 endif()
 
-# WHY: the plugin probe must not decide whether the build succeeds. If Python
-# is absent the app still compiles and reports it at runtime instead.
-set(TDESKTOP_PLUGIN_HOST_LIBS "")
-find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)
-if(Python3_FOUND)
-    set(TDESKTOP_PLUGIN_HOST_LIBS Python3::Module)
-    target_compile_definitions(Telegram PRIVATE PLUGIN_HOST_WITH_PYTHON=1)
-endif()
-
 set_target_properties(Telegram PROPERTIES AUTOMOC ON)
 
 target_link_libraries(Telegram
 PRIVATE
-    ${TDESKTOP_PLUGIN_HOST_LIBS}
     tdesktop::lib_fido2
     tdesktop::lib_tgcalls
     tdesktop::td_export
