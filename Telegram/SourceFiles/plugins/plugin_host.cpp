@@ -8,6 +8,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "plugins/plugin_host.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -18,29 +20,106 @@ namespace Plugins {
 
 bool Start() {
 #if defined(_WIN32)
+	// WHY flush every line: the client is a GUI-subsystem binary, so
+	// anything still buffered when the process dies would vanish.
+	const auto note = [](const char *message) {
+		std::fputs(message, stderr);
+		std::fputc('\n', stderr);
+		std::fflush(stderr);
+	};
+
 	// The probe loads CPython at runtime instead of linking a Py import
 	// library: a hard link would pin the exe to python3XX.dll at load time
 	// and stop it from starting on hosts without that exact version.
-	static constexpr const char *names[] = {
-		"python313.dll",
-		"python312.dll",
-		"python311.dll",
-		"python310.dll",
-		"python39.dll",
+	struct Version {
+		const char *tag;
+		const char *dll;
+	};
+	static constexpr Version versions[] = {
+		{ "313", "python313.dll" },
+		{ "312", "python312.dll" },
+		{ "311", "python311.dll" },
+		{ "310", "python310.dll" },
+		{ "39", "python39.dll" },
 	};
 
 	HMODULE module = nullptr;
-	for (const auto *name : names) {
-		module = ::LoadLibraryA(name);
+	char loaded[512] = { 0 };
+	for (const auto &version : versions) {
+		::SetLastError(0);
+		module = ::LoadLibraryA(version.dll);
 		if (module) {
+			std::snprintf(loaded, sizeof(loaded), "%s (by name)", version.dll);
 			break;
 		}
+		char line[256] = { 0 };
+		std::snprintf(
+			line,
+			sizeof(line),
+			"PLUGIN HOST: LoadLibrary(\"%s\") -> err=%lu",
+			version.dll,
+			static_cast<unsigned long>(::GetLastError()));
+		note(line);
 	}
+
 	if (!module) {
-		std::fputs(
-			"PLUGIN HOST: no python dll (3.9-3.13) on the search path\n",
-			stderr);
+		// Standard install locations, for hosts whose Python dir is not on
+		// the PATH the process sees.
+		static constexpr const char *prefixes[] = {
+			"%LOCALAPPDATA%\\Programs\\Python\\Python",
+			"%ProgramFiles%\\Python",
+		};
+		for (const auto &version : versions) {
+			for (const auto *prefix : prefixes) {
+				char candidate[600] = { 0 };
+				char expanded[600] = { 0 };
+				std::snprintf(
+					candidate,
+					sizeof(candidate),
+					"%s%s\\python%s.dll",
+					prefix,
+					version.tag,
+					version.tag);
+				::ExpandEnvironmentStringsA(
+					candidate,
+					expanded,
+					sizeof(expanded));
+				::SetLastError(0);
+				module = ::LoadLibraryA(expanded);
+				if (module) {
+					std::snprintf(
+						loaded,
+						sizeof(loaded),
+						"%s (full path)",
+						expanded);
+					break;
+				}
+			}
+			if (module) {
+				break;
+			}
+		}
+	}
+
+	if (!module) {
+		note("PLUGIN HOST: no python dll (3.9-3.13) by name or install path");
+		if (const auto *path = std::getenv("PATH")) {
+			char line[256] = { 0 };
+			std::snprintf(
+				line,
+				sizeof(line),
+				"PLUGIN HOST: PATH starts with: %.200s",
+				path);
+			note(line);
+		} else {
+			note("PLUGIN HOST: PATH is not set");
+		}
 		return false;
+	}
+	{
+		char line[600] = { 0 };
+		std::snprintf(line, sizeof(line), "PLUGIN HOST: loaded %s", loaded);
+		note(line);
 	}
 
 	using initializeEx = void (*)(int);
@@ -54,7 +133,7 @@ bool Start() {
 	const auto pyRunSimpleString = reinterpret_cast<runSimpleString>(
 		::GetProcAddress(module, "PyRun_SimpleString"));
 	if (!pyInitializeEx || !pyIsInitialized || !pyRunSimpleString) {
-		std::fputs("PLUGIN HOST: python entry points not found\n", stderr);
+		note("PLUGIN HOST: python entry points not found");
 		return false;
 	}
 
@@ -62,7 +141,7 @@ bool Start() {
 	// an ordinary quit fault on the Qt thread.
 	pyInitializeEx(0);
 	if (!pyIsInitialized()) {
-		std::fputs("PLUGIN HOST: Py_InitializeEx failed\n", stderr);
+		note("PLUGIN HOST: Py_InitializeEx failed");
 		return false;
 	}
 	pyRunSimpleString(
@@ -70,7 +149,7 @@ bool Start() {
 		"sys.stderr.write('PLUGIN HOST: python %d.%d.%d ready\\n'"
 		"    % sys.version_info[:3])\n"
 		"sys.stderr.flush()\n");
-	std::fputs("PLUGIN HOST: started\n", stderr);
+	note("PLUGIN HOST: started");
 	return true;
 #else
 	std::fputs(
