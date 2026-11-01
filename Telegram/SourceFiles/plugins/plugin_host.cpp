@@ -9,6 +9,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <thread>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -26,6 +28,31 @@ void Note(const char *message) {
 	std::fputs(message, stderr);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
+}
+
+std::string ToUtf8(const wchar_t *wide, int size = -1) {
+	const auto bytes = ::WideCharToMultiByte(
+		CP_UTF8,
+		0,
+		wide,
+		size,
+		nullptr,
+		0,
+		nullptr,
+		nullptr);
+	auto result = std::string(bytes > 0 ? bytes - 1 : 0, '\0');
+	if (bytes > 1) {
+		::WideCharToMultiByte(
+			CP_UTF8,
+			0,
+			wide,
+			size,
+			result.data(),
+			bytes,
+			nullptr,
+			nullptr);
+	}
+	return result;
 }
 
 struct Version {
@@ -127,6 +154,76 @@ HMODULE FindPython(wchar_t *report, size_t reportSize) {
 	return nullptr;
 }
 
+// The plugins folder sits next to the exe: the client is portable, and
+// that is where the user already has logs and tdata.
+std::wstring PluginsDir() {
+	wchar_t exePath[MAX_PATH] = { 0 };
+	const auto length = ::GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+	if (!length || length >= MAX_PATH) {
+		return {};
+	}
+	const auto slash = std::wcsrchr(exePath, L'\\');
+	if (!slash) {
+		return {};
+	}
+	*slash = 0;
+	return std::wstring(exePath) + L"\\plugins";
+}
+
+// WHY a background thread: Start() runs before the Qt launcher, so any
+// plugin work here would delay client startup. The interpreter owns no
+// Qt state, and plugins get the GIL through PyGILState_Ensure only.
+void RunPlugins(
+	void (*runSimpleString)(const char *),
+	void *(*saveThread)(void),
+	std::string dirUtf8) {
+	const auto gil = PyGILState_Ensure();
+
+	// WHY raw exec per file: each plugin gets its own namespace dict and
+	// its own traceback, so one broken file neither sees another's
+	// globals nor stops the rest.
+	auto script = std::string();
+	script += "import os, sys, traceback\n";
+	script += "sys.stderr.write('PLUGIN HOST: loading plugins from %s\\n' % _dir)\n";
+	script += "sys.stderr.flush()\n";
+	script += "try:\n";
+	script += "    _names = sorted(n for n in os.listdir(_dir)"
+		" if n.lower().endswith('.plugin'))\n";
+	script += "except OSError as _e:\n";
+	script += "    sys.stderr.write('PLUGIN HOST: plugins folder unreadable: %s\\n' % _e)\n";
+	script += "else:\n";
+	script += "    for _n in _names:\n";
+	script += "        _p = os.path.join(_dir, _n)\n";
+	script += "        try:\n";
+	script += "            with open(_p, 'rb') as _f:\n";
+	script += "                _src = _f.read()\n";
+	script += "            _g = {'__name__': 'ayu_plugin_' + os.path.splitext(_n)[0],"
+		" '__file__': _p, 'plugins_dir': _dir}\n";
+	script += "            exec(compile(_src, _p, 'exec'), _g)\n";
+	script += "            sys.stderr.write('PLUGIN HOST: %s: loaded\\n' % _n)\n";
+	script += "        except BaseException:\n";
+	script += "            sys.stderr.write('PLUGIN HOST: %s failed:\\n' % _n)\n";
+	script += "            traceback.print_exc()\n";
+	script += "        sys.stderr.flush()\n";
+	script += "    if not _names:\n";
+	script += "        sys.stderr.write('PLUGIN HOST: no *.plugin files yet\\n')\n";
+	script += "        sys.stderr.flush()\n";
+
+	// The dir goes in through __main__ globals: backslashes become
+	// slashes so no escaping is needed inside the script.
+	auto head = std::string("_dir = ") + dirUtf8 + "\n";
+	// WHY release the GIL here: the main thread holds it since
+	// Py_InitializeEx, and the loader thread can only take it once the
+	// owner lets go. Exactly one SaveThread per interpreter.
+	saveThread();
+	std::thread([=] {
+		const auto gil = PyGILState_Ensure();
+		runSimpleString(head.c_str());
+		runSimpleString(script.c_str());
+		PyGILState_Release(gil);
+	}).detach();
+}
+
 #endif // _WIN32
 
 } // namespace
@@ -159,6 +256,7 @@ bool Start() {
 	using initializeEx = void (*)(int);
 	using isInitialized = int (*)();
 	using runSimpleString = int (*)(const char *);
+	using saveThread = void *(*)(void);
 
 	const auto pyInitializeEx = reinterpret_cast<initializeEx>(
 		::GetProcAddress(module, "Py_InitializeEx"));
@@ -166,7 +264,10 @@ bool Start() {
 		::GetProcAddress(module, "Py_IsInitialized"));
 	const auto pyRunSimpleString = reinterpret_cast<runSimpleString>(
 		::GetProcAddress(module, "PyRun_SimpleString"));
-	if (!pyInitializeEx || !pyIsInitialized || !pyRunSimpleString) {
+	const auto pySaveThread = reinterpret_cast<saveThread>(
+		::GetProcAddress(module, "PyEval_SaveThread"));
+	if (!pyInitializeEx || !pyIsInitialized
+		|| !pyRunSimpleString || !pySaveThread) {
 		Note("PLUGIN HOST: python entry points not found");
 		return false;
 	}
@@ -183,6 +284,24 @@ bool Start() {
 		"sys.stderr.write('PLUGIN HOST: python %d.%d.%d ready\\n'"
 		"    % sys.version_info[:3])\n"
 		"sys.stderr.flush()\n");
+
+	const auto dir = PluginsDir();
+	const auto folderOk = !dir.empty()
+		&& (::CreateDirectoryW(dir.c_str(), nullptr)
+			|| ::GetLastError() == ERROR_ALREADY_EXISTS);
+	{
+		char line[2 * MAX_PATH] = { 0 };
+		std::snprintf(
+			line,
+			sizeof(line),
+			"PLUGIN HOST: plugins folder %s: %ls",
+			folderOk ? "ok" : "unavailable",
+			dir.c_str());
+		Note(line);
+	}
+	if (folderOk) {
+		RunPlugins(pyRunSimpleString, pySaveThread, ToUtf8(dir.c_str()));
+	}
 	Note("PLUGIN HOST: started");
 	return true;
 #else
