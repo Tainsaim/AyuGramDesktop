@@ -173,11 +173,14 @@ std::wstring PluginsDir() {
 // WHY a background thread: Start() runs before the Qt launcher, so any
 // plugin work here would delay client startup. The interpreter owns no
 // Qt state, and plugins get the GIL through PyGILState_Ensure only.
+// WHY no PyGILState_Ensure identifier: nothing links against Python.h,
+// every entry point comes from GetProcAddress, including the GIL ones.
 void RunPlugins(
-	void (*runSimpleString)(const char *),
+	int (*runSimpleString)(const char *),
 	void *(*saveThread)(void),
+	int (*gilEnsure)(),
+	void (*gilRelease)(int),
 	std::string dirUtf8) {
-	const auto gil = PyGILState_Ensure();
 
 	// WHY raw exec per file: each plugin gets its own namespace dict and
 	// its own traceback, so one broken file neither sees another's
@@ -217,10 +220,10 @@ void RunPlugins(
 	// owner lets go. Exactly one SaveThread per interpreter.
 	saveThread();
 	std::thread([=] {
-		const auto gil = PyGILState_Ensure();
+		const auto gil = gilEnsure();
 		runSimpleString(head.c_str());
 		runSimpleString(script.c_str());
-		PyGILState_Release(gil);
+		gilRelease(gil);
 	}).detach();
 }
 
@@ -257,6 +260,8 @@ bool Start() {
 	using isInitialized = int (*)();
 	using runSimpleString = int (*)(const char *);
 	using saveThread = void *(*)(void);
+	using gilEnsure = int (*)();
+	using gilRelease = void (*)(int);
 
 	const auto pyInitializeEx = reinterpret_cast<initializeEx>(
 		::GetProcAddress(module, "Py_InitializeEx"));
@@ -266,8 +271,12 @@ bool Start() {
 		::GetProcAddress(module, "PyRun_SimpleString"));
 	const auto pySaveThread = reinterpret_cast<saveThread>(
 		::GetProcAddress(module, "PyEval_SaveThread"));
-	if (!pyInitializeEx || !pyIsInitialized
-		|| !pyRunSimpleString || !pySaveThread) {
+	const auto pyGilEnsure = reinterpret_cast<gilEnsure>(
+		::GetProcAddress(module, "PyGILState_Ensure"));
+	const auto pyGilRelease = reinterpret_cast<gilRelease>(
+		::GetProcAddress(module, "PyGILState_Release"));
+	if (!pyInitializeEx || !pyIsInitialized || !pyRunSimpleString
+		|| !pySaveThread || !pyGilEnsure || !pyGilRelease) {
 		Note("PLUGIN HOST: python entry points not found");
 		return false;
 	}
@@ -300,7 +309,12 @@ bool Start() {
 		Note(line);
 	}
 	if (folderOk) {
-		RunPlugins(pyRunSimpleString, pySaveThread, ToUtf8(dir.c_str()));
+		RunPlugins(
+			pyRunSimpleString,
+			pySaveThread,
+			pyGilEnsure,
+			pyGilRelease,
+			ToUtf8(dir.c_str()));
 	}
 	Note("PLUGIN HOST: started");
 	return true;
